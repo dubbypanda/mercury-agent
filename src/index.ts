@@ -37,6 +37,7 @@ import {
   removeDiscordUser,
   clearDiscordAccess,
   getSlackAccessSummary,
+  hasSlackAdmins,
   findSlackPendingRequest,
   approveSlackPendingRequest,
   rejectSlackPendingRequest,
@@ -1185,6 +1186,85 @@ async function runAdminPairingFlow(waChannel: WhatsAppChannel): Promise<void> {
   }
 }
 
+/**
+ * Full Slack setup flow — shows instructions, prompts for tokens, saves config.
+ * Used both for first-time setup and reconfiguration.
+ */
+async function runSlackSetup(config: MercuryConfig, isReconfig: boolean): Promise<void> {
+  if (isReconfig) {
+    console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
+  } else {
+    console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
+  }
+  console.log(chalk.dim('  To create a Slack app:'));
+  console.log(chalk.dim('    1. Go to https://api.slack.com/apps → Create New App → From scratch'));
+  console.log(chalk.dim('    2. Under "Socket Mode", enable it and generate an App-Level Token'));
+  console.log(chalk.dim('       with connections:write scope → copy the xapp- token'));
+  console.log(chalk.dim('    3. Under "OAuth & Permissions", add Bot Token Scopes:'));
+  console.log(chalk.dim('       chat:write, chat:write.public, chat:write.customize,'));
+  console.log(chalk.dim('       channels:history, groups:history, im:history, im:write,'));
+  console.log(chalk.dim('       files:write, commands, app_mentions:read'));
+  console.log(chalk.dim('    4. Install app to workspace → copy Bot User OAuth Token (xoxb-)'));
+  console.log(chalk.dim('    5. Under "Event Subscriptions", enable and subscribe to:'));
+  console.log(chalk.dim('       message.channels, message.groups, message.im, app_mention'));
+  console.log(chalk.dim('    6. Under "Interactivity & Shortcuts", enable interactivity'));
+  console.log(chalk.dim('    7. Under "Slash Commands", create /mercury command'));
+  console.log(chalk.dim('    8. Under "App Home", check "Allow users to send Slash commands'));
+  console.log(chalk.dim('       and messages from the messages tab"'));
+  console.log(chalk.dim('    9. Invite the bot to your channel: /invite @Mercury'));
+  console.log(chalk.dim('    10. DM the bot /mercury start to become the first admin.'));
+  console.log(chalk.dim('  Channel members can chat openly. DMs require admin approval.'));
+
+  const slMask = isReconfig && config.channels.slack.botToken ? ` [${maskKey(config.channels.slack.botToken)}]` : '';
+  const slackBotToken = await ask(chalk.white(`  Slack Bot Token${slMask} (starts with xoxb-): `));
+  if (isReconfig && slackBotToken.toLowerCase() === 'none') {
+    config.channels.slack.enabled = false;
+    config.channels.slack.botToken = '';
+    clearSlackAccess(config);
+  } else if (slackBotToken) {
+    if (slackBotToken !== config.channels.slack.botToken) {
+      clearSlackAccess(config);
+    }
+    config.channels.slack.botToken = slackBotToken;
+    appendToEnv('SLACK_BOT_TOKEN', slackBotToken);
+  }
+
+  if (config.channels.slack.enabled || config.channels.slack.botToken) {
+    const slAppMask = isReconfig && config.channels.slack.appToken ? ` [${maskKey(config.channels.slack.appToken)}]` : '';
+    const slackAppToken = await ask(chalk.white(`  Slack App-Level Token${slAppMask} (starts with xapp-): `));
+    if (slackAppToken && slackAppToken.toLowerCase() !== 'none') {
+      config.channels.slack.appToken = slackAppToken;
+      appendToEnv('SLACK_APP_TOKEN', slackAppToken);
+    } else if (slackAppToken.toLowerCase() === 'none') {
+      config.channels.slack.appToken = '';
+    }
+
+    if (config.channels.slack.botToken) {
+      config.channels.slack.enabled = true;
+
+      if (!config.channels.slack.channelId) {
+        console.log(chalk.dim('  To find a Channel ID: right-click the channel name → Copy Channel ID.'));
+        const slChannelId = await ask(chalk.white('  Slack Channel ID (optional — leave empty for all channels): '));
+        if (slChannelId.trim()) {
+          config.channels.slack.channelId = slChannelId.trim();
+        }
+      }
+
+      if (!config.channels.slack.teamId) {
+        const slTeamId = await ask(chalk.white('  Slack Team/Workspace ID (optional): '));
+        if (slTeamId.trim()) {
+          config.channels.slack.teamId = slTeamId.trim();
+        }
+      }
+
+      saveConfig(config);
+    }
+  } else if (!config.channels.slack.botToken) {
+    config.channels.slack.enabled = false;
+    saveConfig(config);
+  }
+}
+
 async function configure(existingConfig?: MercuryConfig): Promise<void> {
   const isReconfig = !!existingConfig;
   const config = existingConfig ?? loadConfig();
@@ -1734,172 +1814,238 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
   hr();
   console.log('');
   console.log(chalk.bold.white('  Discord (optional)'));
-  if (isReconfig) {
-    console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
-  } else {
-    console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
-  }
-  console.log(chalk.dim('  To create a Discord bot:'));
-  console.log(chalk.dim('    1. Go to https://discord.com/developers/applications'));
-  console.log(chalk.dim('    2. Click "New Application" → give it a name'));
-  console.log(chalk.dim('    3. Navigate to Bot → Click "Reset Token" → Copy the token'));
-  console.log(chalk.dim('    4. Enable Privileged Gateway Intents:'));
-  console.log(chalk.dim('       - Message Content Intent'));
-  console.log(chalk.dim('    5. Go to OAuth2 → URL Generator:'));
-  console.log(chalk.dim('       Scopes: bot, applications.commands'));
-  console.log(chalk.dim('       Bot Permissions: Send Messages, Read Message History,'));
-  console.log(chalk.dim('       Use Slash Commands, Attach Files, Embed Links'));
-  console.log(chalk.dim('    6. Open the generated URL to invite the bot to your server'));
-  console.log(chalk.dim('    7. Optionally create a "Mercury Admin" role in your server'));
-  console.log(chalk.dim('  Guild members can chat openly. DMs require pairing (like Telegram).'));
-  console.log('');
 
-  const dcMask = isReconfig && config.channels.discord.botToken ? ` [${maskKey(config.channels.discord.botToken)}]` : '';
-  const discordToken = await ask(chalk.white(`  Discord Bot Token${dcMask}: `));
-  if (isReconfig && discordToken.toLowerCase() === 'none') {
-    config.channels.discord.enabled = false;
-    config.channels.discord.botToken = '';
-    clearDiscordAccess(config);
-  } else if (discordToken) {
-    if (discordToken !== config.channels.discord.botToken) {
-      clearDiscordAccess(config);
-    }
-    config.channels.discord.botToken = discordToken;
-    appendToEnv('DISCORD_BOT_TOKEN', discordToken);
-    config.channels.discord.enabled = true;
-  }
-
-  if (config.channels.discord.enabled && config.channels.discord.botToken) {
-    if (!config.channels.discord.guildId) {
+  // If already fully paired, offer simple reconfigure prompt
+  if (isReconfig && config.channels.discord.enabled && config.channels.discord.botToken && hasDiscordAdminsFn(config)) {
+    console.log(chalk.green(`  ✓ Discord paired: ${getDiscordAccessSummary(config)}`));
+    const reconfig = await ask(chalk.white('  Reconfigure? (y/N): '));
+    if (reconfig.trim().toLowerCase() !== 'y' && reconfig.trim().toLowerCase() !== 'yes') {
+      // Skip — keep existing config, fall through to Slack section below
+    } else {
+      // Fall through to full setup below
+      console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
+      console.log(chalk.dim('  To create a Discord bot:'));
+      console.log(chalk.dim('    1. Go to https://discord.com/developers/applications'));
+      console.log(chalk.dim('    2. Click "New Application" → give it a name'));
+      console.log(chalk.dim('    3. Navigate to Bot → Click "Reset Token" → Copy the token'));
+      console.log(chalk.dim('    4. Enable Privileged Gateway Intents:'));
+      console.log(chalk.dim('       - Message Content Intent'));
+      console.log(chalk.dim('    5. Go to OAuth2 → URL Generator:'));
+      console.log(chalk.dim('       Scopes: bot, applications.commands'));
+      console.log(chalk.dim('       Bot Permissions: Send Messages, Read Message History,'));
+      console.log(chalk.dim('       Use Slash Commands, Attach Files, Embed Links'));
+      console.log(chalk.dim('    6. Open the generated URL to invite the bot to your server'));
+      console.log(chalk.dim('    7. Optionally create a "Mercury Admin" role in your server'));
+      console.log(chalk.dim('  Guild members can chat openly. DMs require pairing (like Telegram).'));
       console.log('');
-      console.log(chalk.dim('  To find your Server ID: in Discord, go to Settings → App Settings →'));
-      console.log(chalk.dim('  Advanced → toggle Developer Mode ON. Then right-click your server'));
-      console.log(chalk.dim('  name in the sidebar → Copy Server ID.'));
-      const guildId = await ask(chalk.white('  Discord Guild/Server ID (optional — leave empty for all servers): '));
-      if (guildId.trim()) {
-        config.channels.discord.guildId = guildId.trim();
+
+      const dcMask = config.channels.discord.botToken ? ` [${maskKey(config.channels.discord.botToken)}]` : '';
+      const discordToken = await ask(chalk.white(`  Discord Bot Token${dcMask}: `));
+      if (discordToken.toLowerCase() === 'none') {
+        config.channels.discord.enabled = false;
+        config.channels.discord.botToken = '';
+        clearDiscordAccess(config);
+      } else if (discordToken) {
+        if (discordToken !== config.channels.discord.botToken) {
+          clearDiscordAccess(config);
+        }
+        config.channels.discord.botToken = discordToken;
+        appendToEnv('DISCORD_BOT_TOKEN', discordToken);
+        config.channels.discord.enabled = true;
       }
-    }
 
-    if (!config.channels.discord.channelId) {
-      console.log(chalk.dim('  To find a Channel ID: right-click the channel name in the sidebar → Copy Channel ID.'));
-      const channelId = await ask(chalk.white('  Discord Channel ID (optional — leave empty for all channels): '));
-      if (channelId.trim()) {
-        config.channels.discord.channelId = channelId.trim();
+      if (config.channels.discord.enabled && config.channels.discord.botToken) {
+        const guildIdCurrent = config.channels.discord.guildId ? ` [${config.channels.discord.guildId}]` : '';
+        const guildId = await ask(chalk.white(`  Discord Guild/Server ID${guildIdCurrent} (optional — leave empty for all): `));
+        if (guildId.trim()) {
+          config.channels.discord.guildId = guildId.trim();
+        }
+
+        const channelIdCurrent = config.channels.discord.channelId ? ` [${config.channels.discord.channelId}]` : '';
+        const channelId = await ask(chalk.white(`  Discord Channel ID${channelIdCurrent} (optional — leave empty for all): `));
+        if (channelId.trim()) {
+          config.channels.discord.channelId = channelId.trim();
+        }
+
+        const adminRoleCurrent = config.channels.discord.adminRoleName ? ` [${config.channels.discord.adminRoleName}]` : '';
+        const adminRoleName = await ask(chalk.white(`  Admin role name${adminRoleCurrent} [Mercury Admin]: `));
+        if (adminRoleName.trim()) {
+          config.channels.discord.adminRoleName = adminRoleName.trim();
+        } else if (!config.channels.discord.adminRoleName) {
+          config.channels.discord.adminRoleName = 'Mercury Admin';
+        }
+
+        saveConfig(config);
       }
+
+      await completeInitialDiscordPairing(config);
+    }
+  } else {
+    // Not yet paired — show full setup
+    if (isReconfig) {
+      console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
+    } else {
+      console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
+    }
+    console.log(chalk.dim('  To create a Discord bot:'));
+    console.log(chalk.dim('    1. Go to https://discord.com/developers/applications'));
+    console.log(chalk.dim('    2. Click "New Application" → give it a name'));
+    console.log(chalk.dim('    3. Navigate to Bot → Click "Reset Token" → Copy the token'));
+    console.log(chalk.dim('    4. Enable Privileged Gateway Intents:'));
+    console.log(chalk.dim('       - Message Content Intent'));
+    console.log(chalk.dim('    5. Go to OAuth2 → URL Generator:'));
+    console.log(chalk.dim('       Scopes: bot, applications.commands'));
+    console.log(chalk.dim('       Bot Permissions: Send Messages, Read Message History,'));
+    console.log(chalk.dim('       Use Slash Commands, Attach Files, Embed Links'));
+    console.log(chalk.dim('    6. Open the generated URL to invite the bot to your server'));
+    console.log(chalk.dim('    7. Optionally create a "Mercury Admin" role in your server'));
+    console.log(chalk.dim('  Guild members can chat openly. DMs require pairing (like Telegram).'));
+    console.log('');
+
+    const dcMask = isReconfig && config.channels.discord.botToken ? ` [${maskKey(config.channels.discord.botToken)}]` : '';
+    const discordToken = await ask(chalk.white(`  Discord Bot Token${dcMask}: `));
+    if (isReconfig && discordToken.toLowerCase() === 'none') {
+      config.channels.discord.enabled = false;
+      config.channels.discord.botToken = '';
+      clearDiscordAccess(config);
+    } else if (discordToken) {
+      if (discordToken !== config.channels.discord.botToken) {
+        clearDiscordAccess(config);
+      }
+      config.channels.discord.botToken = discordToken;
+      appendToEnv('DISCORD_BOT_TOKEN', discordToken);
+      config.channels.discord.enabled = true;
     }
 
-    const adminRoleCurrent = isReconfig && config.channels.discord.adminRoleName ? ` [${config.channels.discord.adminRoleName}]` : '';
-    const adminRoleName = await ask(chalk.white(`  Admin role name${adminRoleCurrent} [Mercury Admin]: `));
-    if (adminRoleName.trim()) {
-      config.channels.discord.adminRoleName = adminRoleName.trim();
-    } else if (!config.channels.discord.adminRoleName) {
-      config.channels.discord.adminRoleName = 'Mercury Admin';
+    if (config.channels.discord.enabled && config.channels.discord.botToken) {
+      if (!config.channels.discord.guildId) {
+        console.log('');
+        console.log(chalk.dim('  To find your Server ID: in Discord, go to Settings → App Settings →'));
+        console.log(chalk.dim('  Advanced → toggle Developer Mode ON. Then right-click your server'));
+        console.log(chalk.dim('  name in the sidebar → Copy Server ID.'));
+        const guildId = await ask(chalk.white('  Discord Guild/Server ID (optional — leave empty for all servers): '));
+        if (guildId.trim()) {
+          config.channels.discord.guildId = guildId.trim();
+        }
+      }
+
+      if (!config.channels.discord.channelId) {
+        console.log(chalk.dim('  To find a Channel ID: right-click the channel name in the sidebar → Copy Channel ID.'));
+        const channelId = await ask(chalk.white('  Discord Channel ID (optional — leave empty for all channels): '));
+        if (channelId.trim()) {
+          config.channels.discord.channelId = channelId.trim();
+        }
+      }
+
+      const adminRoleCurrent = isReconfig && config.channels.discord.adminRoleName ? ` [${config.channels.discord.adminRoleName}]` : '';
+      const adminRoleName = await ask(chalk.white(`  Admin role name${adminRoleCurrent} [Mercury Admin]: `));
+      if (adminRoleName.trim()) {
+        config.channels.discord.adminRoleName = adminRoleName.trim();
+      } else if (!config.channels.discord.adminRoleName) {
+        config.channels.discord.adminRoleName = 'Mercury Admin';
+      }
+
+      saveConfig(config);
+    } else if (!config.channels.discord.botToken) {
+      config.channels.discord.enabled = false;
+      saveConfig(config);
     }
 
-    saveConfig(config);
-  } else if (!config.channels.discord.botToken) {
-    config.channels.discord.enabled = false;
-    saveConfig(config);
+    await completeInitialDiscordPairing(config);
   }
-
-  await completeInitialDiscordPairing(config);
 
   hr();
   console.log('');
   console.log(chalk.bold.white('  Slack (optional)'));
-  if (isReconfig) {
-    console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
+
+  // If already fully paired, offer simple reconfigure prompt
+  if (isReconfig && config.channels.slack.enabled && config.channels.slack.botToken && hasSlackAdmins(config)) {
+    console.log(chalk.green(`  ✓ Slack paired: ${getSlackAccessSummary(config)}`));
+    const reconfig = await ask(chalk.white('  Reconfigure? (y/N): '));
+    if (reconfig.trim().toLowerCase() !== 'y' && reconfig.trim().toLowerCase() !== 'yes') {
+      // Skip — keep existing config
+    } else {
+      await runSlackSetup(config, isReconfig);
+    }
   } else {
-    console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
-  }
-  console.log(chalk.dim('  To create a Slack app:'));
-  console.log(chalk.dim('    1. Go to https://api.slack.com/apps → Create New App → From scratch'));
-  console.log(chalk.dim('    2. Under "Socket Mode", enable it and generate an App-Level Token'));
-  console.log(chalk.dim('       with connections:write scope → copy the xapp- token'));
-  console.log(chalk.dim('    3. Under "OAuth & Permissions", add Bot Token Scopes:'));
-  console.log(chalk.dim('       chat:write, chat:write.public, chat:write.customize,'));
-  console.log(chalk.dim('       channels:history, groups:history, im:history, im:write,'));
-  console.log(chalk.dim('       files:write, commands, app_mentions:read'));
-  console.log(chalk.dim('    4. Install app to workspace → copy Bot User OAuth Token (xoxb-)'));
-  console.log(chalk.dim('    5. Under "Event Subscriptions", enable and subscribe to:'));
-  console.log(chalk.dim('       message.channels, message.groups, message.im, app_mention'));
-  console.log(chalk.dim('    6. Under "Interactivity & Shortcuts", enable interactivity'));
-  console.log(chalk.dim('    7. Under "Slash Commands", create /mercury command'));
-  console.log(chalk.dim('    8. Under "App Home", check "Allow users to send Slash commands'));
-  console.log(chalk.dim('       and messages from the messages tab"'));
-  console.log(chalk.dim('    9. Invite the bot to your channel: /invite @Mercury'));
-  console.log(chalk.dim('    10. DM the bot /mercury start to become the first admin.'));
-  console.log(chalk.dim('  Channel members can chat openly. DMs require admin approval.'));
-
-  const slMask = isReconfig && config.channels.slack.botToken ? ` [${maskKey(config.channels.slack.botToken)}]` : '';
-  const slackBotToken = await ask(chalk.white(`  Slack Bot Token${slMask} (starts with xoxb-): `));
-  if (isReconfig && slackBotToken.toLowerCase() === 'none') {
-    config.channels.slack.enabled = false;
-    config.channels.slack.botToken = '';
-    clearSlackAccess(config);
-  } else if (slackBotToken) {
-    if (slackBotToken !== config.channels.slack.botToken) {
-      clearSlackAccess(config);
-    }
-    config.channels.slack.botToken = slackBotToken;
-    appendToEnv('SLACK_BOT_TOKEN', slackBotToken);
-  }
-
-  if (config.channels.slack.enabled || config.channels.slack.botToken) {
-    const slAppMask = isReconfig && config.channels.slack.appToken ? ` [${maskKey(config.channels.slack.appToken)}]` : '';
-    const slackAppToken = await ask(chalk.white(`  Slack App-Level Token${slAppMask} (starts with xapp-): `));
-    if (slackAppToken && slackAppToken.toLowerCase() !== 'none') {
-      config.channels.slack.appToken = slackAppToken;
-      appendToEnv('SLACK_APP_TOKEN', slackAppToken);
-    } else if (slackAppToken.toLowerCase() === 'none') {
-      config.channels.slack.appToken = '';
-    }
-
-    if (config.channels.slack.botToken) {
-      config.channels.slack.enabled = true;
-
-      if (!config.channels.slack.channelId) {
-        console.log(chalk.dim('  To find a Channel ID: right-click the channel name → Copy Channel ID.'));
-        const slChannelId = await ask(chalk.white('  Slack Channel ID (optional — leave empty for all channels): '));
-        if (slChannelId.trim()) {
-          config.channels.slack.channelId = slChannelId.trim();
-        }
-      }
-
-      if (!config.channels.slack.teamId) {
-        const slTeamId = await ask(chalk.white('  Slack Team/Workspace ID (optional): '));
-        if (slTeamId.trim()) {
-          config.channels.slack.teamId = slTeamId.trim();
-        }
-      }
-
-      saveConfig(config);
-    }
-  } else if (!config.channels.slack.botToken) {
-    config.channels.slack.enabled = false;
-    saveConfig(config);
+    await runSlackSetup(config, isReconfig);
   }
 
   // ── WhatsApp ─────────────────────────────────────────────────────
   hr();
   console.log('');
   console.log(chalk.bold.white('  WhatsApp (optional)'));
-  if (isReconfig && config.channels.whatsapp.phoneNumber) {
+
+  const wa = config.channels.whatsapp;
+  const waFullyPaired = wa.paired && wa.adminPaired && !!wa.groupId && wa.enabled && !!wa.phoneNumber;
+
+  if (isReconfig && waFullyPaired) {
+    // Already fully paired — show simple reconfigure prompt
+    const groupLabel = wa.groupName ? `group "${wa.groupName}"` : 'group detected';
+    console.log(chalk.green(`  ✓ WhatsApp linked to ${redactPhone(wa.phoneNumber)} — ${groupLabel}, admin paired`));
+    const reconfig = await ask(chalk.white('  Reconfigure? (y/N): '));
+    if (reconfig.trim().toLowerCase() === 'y' || reconfig.trim().toLowerCase() === 'yes') {
+      // Show the advanced menu
+      console.log(chalk.dim('  Enter "none" to disable. "reset" to clear session and re-pair. "unregister" to unlink device.'));
+      console.log('');
+      const waPhoneMask = ` [${redactPhone(wa.phoneNumber)}]`;
+      const waPhone = await ask(chalk.white(`  WhatsApp Phone Number${waPhoneMask}: `));
+      if (waPhone.toLowerCase() === 'none') {
+        config.channels.whatsapp.enabled = false;
+        config.channels.whatsapp.phoneNumber = '';
+        config.channels.whatsapp.registered = false;
+        config.channels.whatsapp.paired = false;
+        config.channels.whatsapp.adminPaired = false;
+        config.channels.whatsapp.admin = null;
+        config.channels.whatsapp.groupId = '';
+        deleteAuthDir();
+        saveConfig(config);
+      } else if (waPhone.toLowerCase() === 'reset') {
+        deleteAuthDir();
+        config.channels.whatsapp.paired = false;
+        config.channels.whatsapp.adminPaired = false;
+        config.channels.whatsapp.admin = null;
+        config.channels.whatsapp.groupId = '';
+        config.channels.whatsapp.enabled = true;
+        saveConfig(config);
+        console.log('');
+        console.log(chalk.yellow('  WhatsApp session cleared. Starting QR pairing...'));
+        console.log('');
+        await completeInitialWhatsAppPairing(config);
+      } else if (waPhone.toLowerCase() === 'unregister') {
+        deleteAuthDir();
+        config.channels.whatsapp.enabled = false;
+        config.channels.whatsapp.phoneNumber = '';
+        config.channels.whatsapp.registered = false;
+        config.channels.whatsapp.paired = false;
+        config.channels.whatsapp.adminPaired = false;
+        config.channels.whatsapp.admin = null;
+        config.channels.whatsapp.groupId = '';
+        saveConfig(config);
+        console.log('');
+        console.log(chalk.green('  WhatsApp unregistered. Device removed and data deleted.'));
+        console.log('');
+      } else if (waPhone) {
+        config.channels.whatsapp.phoneNumber = waPhone;
+        config.channels.whatsapp.enabled = true;
+        config.channels.whatsapp.registered = true;
+        config.channels.whatsapp.paired = false;
+        config.channels.whatsapp.adminPaired = false;
+        config.channels.whatsapp.admin = null;
+        config.channels.whatsapp.groupId = '';
+        deleteAuthDir();
+        saveConfig(config);
+        await completeInitialWhatsAppPairing(config);
+      }
+    }
+  } else if (isReconfig && wa.phoneNumber && (wa.paired || wa.registered)) {
+    // Partially set up — resume from incomplete step
     console.log(chalk.dim('  Leave empty to keep current. Enter "none" to disable.'));
     console.log(chalk.dim('  Enter "reset" to clear session and re-pair with a QR code.'));
     console.log(chalk.dim('  Enter "unregister" to unlink device from WhatsApp and delete all data.'));
-  } else {
-    console.log(chalk.dim('  Leave empty to skip. You can add it later with mercury doctor.'));
-    console.log(chalk.dim('  WhatsApp lets you chat with Mercury through a WhatsApp group.'));
-    console.log(chalk.dim('  You scan a QR code to link Mercury as a companion device.'));
-    console.log(chalk.dim('  Then create a WhatsApp group named "Mercury" (just yourself).'));
-    console.log(chalk.dim('  Mercury will auto-detect the group and listen for messages there.'));
-  }
-  console.log('');
+    console.log('');
 
-  if (isReconfig && config.channels.whatsapp.phoneNumber) {
-    const waPhoneMask = ` [${redactPhone(config.channels.whatsapp.phoneNumber)}]`;
+    const waPhoneMask = ` [${redactPhone(wa.phoneNumber)}]`;
     const waPhone = await ask(chalk.white(`  WhatsApp Phone Number${waPhoneMask}: `));
     if (waPhone.toLowerCase() === 'none') {
       config.channels.whatsapp.enabled = false;
@@ -1956,7 +2102,6 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
       }
     } else {
       // User pressed Enter to keep existing number — check if setup is incomplete
-      const wa = config.channels.whatsapp;
       if (wa.registered && (!wa.paired || !wa.adminPaired || !wa.groupId)) {
         console.log('');
         if (!wa.paired) {
@@ -1971,6 +2116,14 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
       }
     }
   } else {
+    // Not configured at all — first-time setup
+    console.log(chalk.dim('  Leave empty to skip. You can add it later with mercury doctor.'));
+    console.log(chalk.dim('  WhatsApp lets you chat with Mercury through a WhatsApp group.'));
+    console.log(chalk.dim('  You scan a QR code to link Mercury as a companion device.'));
+    console.log(chalk.dim('  Then create a WhatsApp group named "Mercury" (just yourself).'));
+    console.log(chalk.dim('  Mercury will auto-detect the group and listen for messages there.'));
+    console.log('');
+
     const waPhone = await ask(chalk.white('  WhatsApp Phone Number (with country code, e.g., +1234567890): '));
     if (waPhone) {
       config.channels.whatsapp.phoneNumber = waPhone;
