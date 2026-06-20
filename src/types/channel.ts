@@ -137,3 +137,24 @@ export interface SlackChannelConfig extends ChannelConfig {
   members: SlackAccessUser[];
   pending: SlackPendingRequest[];
 }
+
+export interface WhatsAppAdmin {
+  jid: string;
+  phoneNumber: string;
+  name?: string;
+  pairedAt: string;
+}
+
+export type WhatsAppMode = 'self' | 'group';
+
+export interface WhatsAppChannelConfig extends ChannelConfig {
+  type: 'whatsapp';
+  phoneNumber: string;
+  registered: boolean;
+  paired: boolean;
+  admin: WhatsAppAdmin | null;
+  adminPaired: boolean;
+  mode: WhatsAppMode;
+  groupId?: string;
+  groupName?: string;
+}

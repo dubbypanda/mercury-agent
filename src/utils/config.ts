@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { config as loadDotenv } from 'dotenv';
-import type { SignalAccessUser, SignalPendingRequest, DiscordAccessUser, DiscordPendingRequest, SlackAccessUser, SlackPendingRequest } from '../types/channel.js';
+import type { SignalAccessUser, SignalPendingRequest, DiscordAccessUser, DiscordPendingRequest, SlackAccessUser, SlackPendingRequest, WhatsAppAdmin } from '../types/channel.js';
 
 const MERCURY_HOME = join(homedir(), '.mercury');
 
@@ -45,6 +45,13 @@ export interface TelegramPendingRequest {
   firstName?: string;
   requestedAt: string;
   pairingCode?: string;
+}
+
+export interface WhatsAppAdminConfig {
+  jid: string;
+  phoneNumber: string;
+  name?: string;
+  pairedAt: string;
 }
 
 export type ProviderName =
@@ -125,6 +132,17 @@ export interface MercuryConfig {
       admins: SlackAccessUser[];
       members: SlackAccessUser[];
       pending: SlackPendingRequest[];
+    };
+    whatsapp: {
+      enabled: boolean;
+      phoneNumber: string;
+      registered: boolean;
+      paired: boolean;
+      admin: WhatsAppAdminConfig | null;
+      adminPaired: boolean;
+      mode: string;
+      groupId?: string;
+      groupName?: string;
     };
   };
   github: {
@@ -328,6 +346,17 @@ export function getDefaultConfig(): MercuryConfig {
         members: [],
         pending: [],
       },
+      whatsapp: {
+        enabled: getEnvBool('WHATSAPP_ENABLED', false),
+        phoneNumber: getEnv('WHATSAPP_PHONE_NUMBER', ''),
+        registered: false,
+        paired: false,
+        admin: null,
+        adminPaired: false,
+        mode: getEnv('WHATSAPP_MODE', 'group'),
+        groupId: getEnv('WHATSAPP_GROUP_ID', ''),
+        groupName: getEnv('WHATSAPP_GROUP_NAME', 'Mercury'),
+      },
     },
     github: {
       username: getEnv('GITHUB_USERNAME', ''),
@@ -384,14 +413,18 @@ export function loadConfig(): MercuryConfig {
       migrateLegacyOllamaLocalBaseUrl(
         migrateLegacyOllamaCloudBaseUrl(
           migrateLegacySignalAccess(
-            migrateLegacyTelegramAccess(deepMerge(defaults, fileConfig)),
+            migrateLegacyTelegramAccess(
+              migrateLegacyWhatsAppAccess(deepMerge(defaults, fileConfig)),
+            ),
           ),
         ),
       ),
     );
   }
   return migrateLegacyDiscordAccess(
-    migrateLegacyTelegramAccess(getDefaultConfig()),
+    migrateLegacyWhatsAppAccess(
+      migrateLegacyTelegramAccess(getDefaultConfig()),
+    ),
   );
 }
 
@@ -1140,5 +1173,56 @@ export function migrateLegacySlackAccess(config: MercuryConfig): MercuryConfig {
   slack.admins = slack.admins || [];
   slack.members = slack.members || [];
   slack.pending = slack.pending || [];
+  return config;
+}
+
+// ── WhatsApp access helpers ─────────────────────────────────────
+
+export function getWhatsAppAdmin(config: MercuryConfig): WhatsAppAdminConfig | null {
+  return config.channels.whatsapp.admin;
+}
+
+export function hasWhatsAppAdmin(config: MercuryConfig): boolean {
+  return config.channels.whatsapp.admin !== null;
+}
+
+export function getWhatsAppAccessSummary(config: MercuryConfig): string {
+  if (!config.channels.whatsapp.admin) return 'not paired';
+  return `admin: ${config.channels.whatsapp.admin.phoneNumber} (paired ${config.channels.whatsapp.admin.pairedAt})`;
+}
+
+export function setWhatsAppAdmin(config: MercuryConfig, admin: WhatsAppAdminConfig): MercuryConfig {
+  config.channels.whatsapp.admin = admin;
+  config.channels.whatsapp.paired = true;
+  config.channels.whatsapp.registered = true;
+  return config;
+}
+
+export function clearWhatsAppAccess(config: MercuryConfig): MercuryConfig {
+  config.channels.whatsapp.admin = null;
+  config.channels.whatsapp.paired = false;
+  config.channels.whatsapp.registered = false;
+  return config;
+}
+
+export function isWhatsAppPaired(config: MercuryConfig): boolean {
+  return config.channels.whatsapp.paired && config.channels.whatsapp.admin !== null;
+}
+
+export function migrateLegacyWhatsAppAccess(config: MercuryConfig): MercuryConfig {
+  const wa = config.channels.whatsapp as any;
+  if (!wa) return config;
+  if (wa.admin === undefined) wa.admin = null;
+  if (wa.registered === undefined) wa.registered = false;
+  if (wa.paired === undefined) wa.paired = false;
+  if (wa.adminPaired === undefined) wa.adminPaired = !!wa.admin;
+  if (wa.phoneNumber === undefined) wa.phoneNumber = '';
+  if (wa.mode === undefined) wa.mode = 'group';
+  if (wa.groupName === undefined) wa.groupName = 'Mercury';
+  // Clean up stale fields from previous implementation
+  delete wa.sessionDir;
+  delete wa.admins;
+  delete wa.members;
+  delete wa.pending;
   return config;
 }

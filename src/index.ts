@@ -42,11 +42,18 @@ import {
   rejectSlackPendingRequest,
   removeSlackUser,
   clearSlackAccess,
+  getWhatsAppAdmin,
+  hasWhatsAppAdmin,
+  getWhatsAppAccessSummary,
+  setWhatsAppAdmin,
+  clearWhatsAppAccess,
+  isWhatsAppPaired,
 } from './utils/config.js';
 import type { MercuryConfig } from './utils/config.js';
 import type { ProviderName } from './utils/config.js';
 import { logger } from './utils/logger.js';
 import { redactPhone } from './utils/redact.js';
+import { authDirExists, ensureAuthDir, deleteAuthDir, validateAuthState } from './whatsapp/auth.js';
 import { Identity } from './soul/identity.js';
 import { ShortTermMemory, LongTermMemory, EpisodicMemory, migrateLegacyMemory } from './memory/store.js';
 import { UserMemoryStore } from './memory/user-memory.js';
@@ -62,6 +69,7 @@ import { CLIChannel } from './channels/cli.js';
 import { TelegramChannel } from './channels/telegram.js';
 import { SignalChannel } from './channels/signal.js';
 import { DiscordChannel } from './channels/discord.js';
+import { WhatsAppChannel } from './channels/whatsapp.js';
 import { WebChannel } from './channels/web.js';
 import { TokenBudget } from './utils/tokens.js';
 import { CapabilityRegistry } from './capabilities/registry.js';
@@ -1050,6 +1058,133 @@ async function completeInitialDiscordPairing(config: MercuryConfig): Promise<voi
   }
 }
 
+async function completeInitialWhatsAppPairing(config: MercuryConfig): Promise<void> {
+  if (!config.channels.whatsapp.enabled || !config.channels.whatsapp.phoneNumber) {
+    return;
+  }
+
+  // If device linked, group detected, and admin paired — fully set up
+  if (config.channels.whatsapp.paired && validateAuthState() && config.channels.whatsapp.groupId && config.channels.whatsapp.adminPaired) {
+    console.log(chalk.green('  ✓ WhatsApp fully set up.'));
+    console.log('');
+    return;
+  }
+
+  console.log('');
+  console.log(chalk.bold.white('  WhatsApp Linking'));
+  console.log(chalk.dim('  A QR code will appear below. Scan it with WhatsApp:'));
+  console.log(chalk.dim('  Phone > Settings > Linked Devices > Link a device'));
+  console.log(chalk.dim('  Scan the QR code to link Mercury as a companion device.'));
+  console.log('');
+
+  const waChannel = new WhatsAppChannel(config);
+
+  try {
+    await waChannel.startForPairing();
+  } catch (err: any) {
+    console.log(chalk.red(`\n  ✗ Failed to start WhatsApp: ${err.message || err}`));
+    console.log(chalk.dim('  Run "mercury whatsapp pair" later to try again.'));
+    console.log('');
+    return;
+  }
+
+  const success = await waChannel.waitForPairing(180_000);
+
+  if (success) {
+    const freshConfig = loadConfig();
+    console.log('');
+    console.log(chalk.green(`  ✓ WhatsApp linked! Phone: ${freshConfig.channels.whatsapp.admin?.phoneNumber || freshConfig.channels.whatsapp.phoneNumber}`));
+    await runGroupDetectionFlow(waChannel);
+  } else {
+    console.log('');
+    console.log(chalk.yellow('  ⏱ WhatsApp pairing timed out or failed.'));
+    console.log(chalk.dim('  Run "mercury whatsapp pair" to try again.'));
+    console.log('');
+  }
+
+  await waChannel.stop();
+}
+
+/**
+ * Shared group detection flow used after pairing succeeds.
+ * 1. Show group instructions
+ * 2. Wait up to 20 seconds for auto-detection (checking every 5s)
+ * 3. If detected → done
+ * 4. If not detected → ask user to create group and rescan (Y/n)
+ * 5. If Y → rescan; if n → exit
+ */
+async function runGroupDetectionFlow(waChannel: WhatsAppChannel): Promise<void> {
+  console.log('');
+  console.log(chalk.bold.white('  WhatsApp Group Setup'));
+  console.log(chalk.dim('  Mercury listens for messages in a WhatsApp group named "Mercury".'));
+  console.log(chalk.dim('  Create a group on your phone:'));
+  console.log(chalk.dim('    1. Open WhatsApp → New Group'));
+  console.log(chalk.dim('    2. Name it "Mercury" (case-insensitive)'));
+  console.log(chalk.dim('    3. Add any contact, then remove them (or keep them)'));
+  console.log(chalk.dim('  Looking for the group...'));
+  console.log('');
+
+  // Try detecting the group for up to 20 seconds (4 attempts, 5s apart)
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    const detected = await waChannel.detectGroup();
+    if (detected) {
+      console.log(chalk.green(`  ✓ Group detected: ${detected.groupName}`));
+      await runAdminPairingFlow(waChannel);
+      return;
+    }
+  }
+
+  // Not found — ask user to create and rescan
+  while (true) {
+    console.log(chalk.yellow('  ✗ No group named "Mercury" found.'));
+    const answer = await ask(chalk.white('  Create a WhatsApp group named "Mercury" and rescan? (Y/n): '));
+    const choice = answer.trim().toLowerCase();
+    if (choice === 'n' || choice === 'no') {
+      console.log(chalk.dim('  You can run "mercury whatsapp detect-group" later after creating the group.'));
+      console.log('');
+      return;
+    }
+
+    // Rescan — wait 20 seconds again
+    console.log(chalk.dim('  Rescanning for groups...'));
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      const detected = await waChannel.detectGroup();
+      if (detected) {
+        console.log(chalk.green(`  ✓ Group detected: ${detected.groupName}`));
+        await runAdminPairingFlow(waChannel);
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * Wait for the user to send /pair in the WhatsApp group.
+ * Shows instructions, then polls for adminPaired for up to 3 minutes.
+ */
+async function runAdminPairingFlow(waChannel: WhatsAppChannel): Promise<void> {
+  console.log('');
+  console.log(chalk.bold.white('  Final step — Pair as admin'));
+  console.log(chalk.dim('  Open the "Mercury" group on your phone and send:'));
+  console.log(chalk.cyan('    /pair'));
+  console.log(chalk.dim('  Waiting for /pair...'));
+  console.log('');
+
+  const adminPaired = await waChannel.waitForAdminPairing(180_000);
+  if (adminPaired) {
+    const config = loadConfig();
+    console.log(chalk.green(`  ✓ Admin paired: ${config.channels.whatsapp.admin?.phoneNumber || 'OK'}`));
+    console.log(chalk.dim('  Mercury is ready. Send any message in the group to chat.'));
+    console.log('');
+  } else {
+    console.log(chalk.yellow('  ⏱ Timed out waiting for /pair.'));
+    console.log(chalk.dim('  Send /pair in the "Mercury" group later to register as admin.'));
+    console.log('');
+  }
+}
+
 async function configure(existingConfig?: MercuryConfig): Promise<void> {
   const isReconfig = !!existingConfig;
   const config = existingConfig ?? loadConfig();
@@ -1746,6 +1881,114 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
     saveConfig(config);
   }
 
+  // ── WhatsApp ─────────────────────────────────────────────────────
+  hr();
+  console.log('');
+  console.log(chalk.bold.white('  WhatsApp (optional)'));
+  if (isReconfig && config.channels.whatsapp.phoneNumber) {
+    console.log(chalk.dim('  Leave empty to keep current. Enter "none" to disable.'));
+    console.log(chalk.dim('  Enter "reset" to clear session and re-pair with a QR code.'));
+    console.log(chalk.dim('  Enter "unregister" to unlink device from WhatsApp and delete all data.'));
+  } else {
+    console.log(chalk.dim('  Leave empty to skip. You can add it later with mercury doctor.'));
+    console.log(chalk.dim('  WhatsApp lets you chat with Mercury through a WhatsApp group.'));
+    console.log(chalk.dim('  You scan a QR code to link Mercury as a companion device.'));
+    console.log(chalk.dim('  Then create a WhatsApp group named "Mercury" (just yourself).'));
+    console.log(chalk.dim('  Mercury will auto-detect the group and listen for messages there.'));
+  }
+  console.log('');
+
+  if (isReconfig && config.channels.whatsapp.phoneNumber) {
+    const waPhoneMask = ` [${redactPhone(config.channels.whatsapp.phoneNumber)}]`;
+    const waPhone = await ask(chalk.white(`  WhatsApp Phone Number${waPhoneMask}: `));
+    if (waPhone.toLowerCase() === 'none') {
+      config.channels.whatsapp.enabled = false;
+      config.channels.whatsapp.phoneNumber = '';
+      config.channels.whatsapp.registered = false;
+      config.channels.whatsapp.paired = false;
+      config.channels.whatsapp.adminPaired = false;
+      config.channels.whatsapp.admin = null;
+      config.channels.whatsapp.groupId = '';
+      deleteAuthDir();
+      saveConfig(config);
+    } else if (waPhone.toLowerCase() === 'reset') {
+      deleteAuthDir();
+      config.channels.whatsapp.paired = false;
+      config.channels.whatsapp.adminPaired = false;
+      config.channels.whatsapp.admin = null;
+      config.channels.whatsapp.groupId = '';
+      config.channels.whatsapp.enabled = true;
+      saveConfig(config);
+      console.log('');
+      console.log(chalk.yellow('  WhatsApp session cleared. Starting QR pairing...'));
+      console.log('');
+      await completeInitialWhatsAppPairing(config);
+    } else if (waPhone.toLowerCase() === 'unregister') {
+      deleteAuthDir();
+      config.channels.whatsapp.enabled = false;
+      config.channels.whatsapp.phoneNumber = '';
+      config.channels.whatsapp.registered = false;
+      config.channels.whatsapp.paired = false;
+      config.channels.whatsapp.adminPaired = false;
+      config.channels.whatsapp.admin = null;
+      config.channels.whatsapp.groupId = '';
+      saveConfig(config);
+      console.log('');
+      console.log(chalk.green('  WhatsApp unregistered. Device removed and data deleted.'));
+      console.log('');
+    } else if (waPhone) {
+      config.channels.whatsapp.phoneNumber = waPhone;
+      config.channels.whatsapp.enabled = true;
+      config.channels.whatsapp.registered = true;
+      if (!config.channels.whatsapp.paired) {
+        config.channels.whatsapp.paired = false;
+        config.channels.whatsapp.adminPaired = false;
+        config.channels.whatsapp.admin = null;
+        config.channels.whatsapp.groupId = '';
+        deleteAuthDir();
+      }
+      saveConfig(config);
+      if (!config.channels.whatsapp.paired || !config.channels.whatsapp.adminPaired) {
+        console.log('');
+        console.log(chalk.yellow('  WhatsApp setup incomplete. Starting pairing flow...'));
+        console.log('');
+        await completeInitialWhatsAppPairing(config);
+      }
+    } else {
+      // User pressed Enter to keep existing number — check if setup is incomplete
+      const wa = config.channels.whatsapp;
+      if (wa.registered && (!wa.paired || !wa.adminPaired || !wa.groupId)) {
+        console.log('');
+        if (!wa.paired) {
+          console.log(chalk.yellow('  WhatsApp device not linked. Starting QR pairing...'));
+        } else if (!wa.groupId) {
+          console.log(chalk.yellow('  WhatsApp group not detected. Starting group detection...'));
+        } else if (!wa.adminPaired) {
+          console.log(chalk.yellow('  WhatsApp admin not paired. Waiting for /pair in the group...'));
+        }
+        console.log('');
+        await completeInitialWhatsAppPairing(config);
+      }
+    }
+  } else {
+    const waPhone = await ask(chalk.white('  WhatsApp Phone Number (with country code, e.g., +1234567890): '));
+    if (waPhone) {
+      config.channels.whatsapp.phoneNumber = waPhone;
+      config.channels.whatsapp.enabled = true;
+      config.channels.whatsapp.registered = true;
+      config.channels.whatsapp.paired = false;
+      saveConfig(config);
+      console.log('');
+      console.log(chalk.yellow('  Starting WhatsApp linking...'));
+      console.log(chalk.dim('  Scan the QR code below with WhatsApp > Linked Devices > Link a device'));
+      console.log('');
+      await completeInitialWhatsAppPairing(config);
+    } else {
+      config.channels.whatsapp.enabled = false;
+      saveConfig(config);
+    }
+  }
+
   hr();
   console.log('');
   console.log(chalk.bold.white('  GitHub Integration (optional)'));
@@ -2132,6 +2375,7 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     const { channelId, channelType } = capabilities.getChannelContext();
     const telegram = channels.get('telegram');
     const signal = channels.get('signal');
+    const whatsapp = channels.get('whatsapp');
 
     // Explicit channel override from the user
     if (channel === 'signal' && signal) {
@@ -2140,6 +2384,10 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     }
     if (channel === 'telegram' && telegram) {
       await telegram.sendFile(filePath, channelType === 'telegram' ? channelId : undefined);
+      return;
+    }
+    if (channel === 'whatsapp' && whatsapp) {
+      await whatsapp.sendFile(filePath, channelType === 'whatsapp' ? channelId : undefined);
       return;
     }
 
@@ -2153,6 +2401,11 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       return;
     }
 
+    if (channelType === 'whatsapp' && whatsapp) {
+      await whatsapp.sendFile(filePath, channelId);
+      return;
+    }
+
     if (config.channels.telegram.enabled && telegram && getTelegramApprovedUsers(config).length > 0) {
       await telegram.sendFile(filePath);
       return;
@@ -2160,6 +2413,11 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
 
     if (config.channels.signal.enabled && signal && hasSignalAdminsFn(config)) {
       await signal.sendFile(filePath);
+      return;
+    }
+
+    if (config.channels.whatsapp.enabled && whatsapp && hasWhatsAppAdmin(config)) {
+      await whatsapp.sendFile(filePath);
       return;
     }
 
@@ -2269,6 +2527,7 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   const cliChannel = channels.get('cli') as CLIChannel | undefined;
   const tgChannel = channels.get('telegram') as TelegramChannel | undefined;
   const sigChannel = channels.get('signal') as SignalChannel | undefined;
+  const waChannel = channels.get('whatsapp') as WhatsAppChannel | undefined;
 
   if (tgChannel) {
     tgChannel.setChatCommandContext(capabilities.getChatCommandContext()!);
@@ -2276,6 +2535,10 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
 
   if (sigChannel) {
     sigChannel.setChatCommandContext(capabilities.getChatCommandContext()!);
+  }
+
+  if (waChannel) {
+    waChannel.setChatCommandContext(capabilities.getChatCommandContext()!);
   }
 
   setWebWebChannel(webChannel);
@@ -2746,6 +3009,10 @@ program
     console.log(`  Slack:    ${config.channels.slack.enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
     if (config.channels.slack.botToken) {
       console.log(`  Slack Access: ${chalk.white(getSlackAccessSummary(config))}`);
+    }
+    console.log(`  WhatsApp: ${config.channels.whatsapp.enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
+    if (config.channels.whatsapp.phoneNumber) {
+      console.log(`  WhatsApp Access: ${chalk.white(getWhatsAppAccessSummary(config))}`);
     }
     console.log(`  Web:      ${config.web.enabled ? chalk.green(`enabled (http://localhost:${config.web.port})`) : chalk.dim('disabled')}`);
     console.log(`  Skills:   ${skills.length > 0 ? chalk.green(skills.map(s => s.name).join(', ')) : chalk.dim('none')}`);
@@ -3493,6 +3760,225 @@ slackCmd
     console.log(`  Streaming:   ${config.channels.slack.streaming ? chalk.green('yes') : chalk.dim('no')}`);
     console.log(`  Access:       ${chalk.white(getSlackAccessSummary(config))}`);
     console.log('');
+  });
+
+// ── WhatsApp commands ───────────────────────────────────────────────
+
+const whatsappCmd = program
+  .command('whatsapp')
+  .description('Manage WhatsApp channel setup and status');
+
+whatsappCmd
+  .command('status')
+  .description('Show WhatsApp configuration and connection status')
+  .action(() => {
+    const config = loadConfig();
+    console.log(`  Enabled:      ${config.channels.whatsapp.enabled ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Phone:        ${config.channels.whatsapp.phoneNumber || chalk.dim('not set')}`);
+    console.log(`  Registered:   ${config.channels.whatsapp.registered ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Paired:       ${config.channels.whatsapp.paired ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Admin Paired: ${config.channels.whatsapp.adminPaired ? chalk.green('yes') : chalk.dim('no (send /pair in the group)')}`);
+    console.log(`  Mode:         ${chalk.white(config.channels.whatsapp.mode || 'group')}`);
+    if (config.channels.whatsapp.groupId) {
+      console.log(`  Group:        ${chalk.white(config.channels.whatsapp.groupName || 'Mercury')}`);
+      console.log(`  Group ID:     ${chalk.dim(config.channels.whatsapp.groupId)}`);
+    } else if ((config.channels.whatsapp.mode || 'group') === 'group') {
+      console.log(`  Group:        ${chalk.yellow('not detected — run "mercury whatsapp detect-group"')}`);
+    }
+    if (config.channels.whatsapp.admin) {
+      console.log(`  Admin:         ${chalk.white(config.channels.whatsapp.admin.phoneNumber)}`);
+      console.log(`  Paired at:     ${chalk.dim(config.channels.whatsapp.admin.pairedAt)}`);
+    }
+    console.log(`  Auth data:    ${authDirExists() ? chalk.green('present') : chalk.dim('missing')}`);
+    console.log('');
+  });
+
+whatsappCmd
+  .command('pair')
+  .description('Start WhatsApp QR pairing flow')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config.channels.whatsapp.phoneNumber) {
+      console.log(chalk.red('  WhatsApp phone number not set. Run mercury doctor first.'));
+      process.exit(1);
+    }
+
+    deleteAuthDir();
+    config.channels.whatsapp.paired = false;
+    config.channels.whatsapp.admin = null;
+    saveConfig(config);
+
+    console.log('');
+    console.log(chalk.bold.white('  WhatsApp Pairing'));
+    console.log(chalk.dim('  A QR code will appear below. Scan it with WhatsApp:'));
+    console.log(chalk.dim('  Phone > Settings > Linked Devices > Link a device'));
+    console.log('');
+
+    const waChannel = new WhatsAppChannel(config);
+    try {
+      await waChannel.startForPairing();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ Failed to start WhatsApp: ${err.message || err}`));
+      process.exit(1);
+    }
+
+    const success = await waChannel.waitForPairing(180_000);
+    if (success) {
+      const freshConfig = loadConfig();
+      console.log('');
+      console.log(chalk.green(`  ✓ WhatsApp linked! Phone: ${freshConfig.channels.whatsapp.admin?.phoneNumber || freshConfig.channels.whatsapp.phoneNumber}`));
+      await runGroupDetectionFlow(waChannel);
+    } else {
+      console.log('');
+      console.log(chalk.yellow('  ⏱ WhatsApp pairing timed out or failed. Try again.'));
+    }
+    await waChannel.stop();
+  });
+
+whatsappCmd
+  .command('reset')
+  .description('Clear WhatsApp session data and disable channel')
+  .action(() => {
+    const config = loadConfig();
+    deleteAuthDir();
+    config.channels.whatsapp.paired = false;
+    config.channels.whatsapp.admin = null;
+    config.channels.whatsapp.registered = false;
+    config.channels.whatsapp.enabled = false;
+    config.channels.whatsapp.groupId = '';
+    saveConfig(config);
+    console.log(chalk.yellow('  WhatsApp session cleared. Channel disabled.'));
+    console.log(chalk.dim('  Run "mercury whatsapp pair" to re-link, or "mercury doctor" to reconfigure.'));
+  });
+
+whatsappCmd
+  .command('unregister')
+  .description('Unlink device from WhatsApp and delete all session data')
+  .action(async () => {
+    const config = loadConfig();
+    console.log(chalk.yellow('  This will unlink Mercury from your WhatsApp and delete all session data.'));
+    console.log(chalk.dim('  You will need to re-scan a QR code to use WhatsApp again.'));
+    const answer = await ask(chalk.white('  Continue? (y/N): '));
+    if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+      console.log(chalk.dim('  Cancelled.'));
+      return;
+    }
+    deleteAuthDir();
+    config.channels.whatsapp.enabled = false;
+    config.channels.whatsapp.phoneNumber = '';
+    config.channels.whatsapp.registered = false;
+    config.channels.whatsapp.paired = false;
+    config.channels.whatsapp.admin = null;
+    config.channels.whatsapp.groupId = '';
+    saveConfig(config);
+    console.log(chalk.green('  WhatsApp unregistered. Device removed and data deleted.'));
+  });
+
+whatsappCmd
+  .command('list')
+  .description('Show WhatsApp admin info')
+  .action(() => {
+    const config = loadConfig();
+    if (!config.channels.whatsapp.admin) {
+      console.log(chalk.dim('  No WhatsApp admin paired yet.'));
+    } else {
+      const admin = config.channels.whatsapp.admin;
+      console.log(`  Admin Phone:  ${chalk.white(admin.phoneNumber)}`);
+      console.log(`  Admin JID:    ${chalk.dim(admin.jid)}`);
+      console.log(`  Paired at:    ${chalk.dim(admin.pairedAt)}`);
+    }
+    console.log('');
+  });
+
+whatsappCmd
+  .command('detect-group')
+  .description('Auto-detect a WhatsApp group named "Mercury" and configure it')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config.channels.whatsapp.paired || !authDirExists()) {
+      console.log(chalk.red('  WhatsApp is not paired. Run "mercury whatsapp pair" first.'));
+      process.exit(1);
+    }
+
+    console.log('');
+    console.log(chalk.bold.white('  Detecting WhatsApp group...'));
+    console.log(chalk.dim('  Make sure you have created a WhatsApp group named "Mercury".'));
+    console.log('');
+
+    const waChannel = new WhatsAppChannel(config);
+    try {
+      await waChannel.startForPairing();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ Failed to start WhatsApp: ${err.message || err}`));
+      process.exit(1);
+    }
+
+    // Wait for connection
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    const detected = await waChannel.detectGroup();
+    if (detected) {
+      console.log(chalk.green(`  ✓ Group detected: ${detected.groupName} (${detected.groupId})`));
+      console.log(chalk.dim('  Mercury will now listen for messages in this group.'));
+    } else {
+      console.log(chalk.yellow('  ✗ No group named "Mercury" found.'));
+      console.log(chalk.dim('  Create a WhatsApp group named "Mercury" and try again.'));
+      console.log(chalk.dim('  Tip: You can add any contact to create the group, then remove them.'));
+    }
+
+    await waChannel.stop();
+  });
+
+whatsappCmd
+  .command('groups')
+  .description('List all WhatsApp groups the account participates in')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config.channels.whatsapp.paired || !authDirExists()) {
+      console.log(chalk.red('  WhatsApp is not paired. Run "mercury whatsapp pair" first.'));
+      process.exit(1);
+    }
+
+    console.log('');
+    console.log(chalk.bold.white('  WhatsApp Groups'));
+    console.log('');
+
+    const waChannel = new WhatsAppChannel(config);
+    try {
+      await waChannel.startForPairing();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ Failed to start WhatsApp: ${err.message || err}`));
+      process.exit(1);
+    }
+
+    // Wait for connection
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    const groups = await waChannel.listGroups();
+    if (groups.length === 0) {
+      console.log(chalk.dim('  No groups found.'));
+    } else {
+      const configuredGroupId = config.channels.whatsapp.groupId;
+      for (const g of groups) {
+        const marker = g.groupId === configuredGroupId ? chalk.green(' ← active') : '';
+        console.log(`  ${chalk.white(g.groupName)} ${chalk.dim(g.groupId)}${marker}`);
+      }
+    }
+    console.log('');
+
+    await waChannel.stop();
+  });
+
+whatsappCmd
+  .command('set-group <groupId>')
+  .description('Manually set the WhatsApp group ID to listen for messages in')
+  .action((groupId: string) => {
+    const config = loadConfig();
+    config.channels.whatsapp.groupId = groupId;
+    config.channels.whatsapp.mode = 'group';
+    saveConfig(config);
+    console.log(chalk.green(`  ✓ Group ID set to: ${groupId}`));
+    console.log(chalk.dim('  Restart Mercury for changes to take effect.'));
   });
 
 const serviceCmd = program
