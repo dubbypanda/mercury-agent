@@ -25,6 +25,7 @@ export async function createImessagesApp(config: IMessagesConfig): Promise<any> 
     projectId: config.projectId,
     projectSecret: config.projectSecret,
     providers: [imessageMod.imessage.config()],
+    options: { logLevel: 'error' },
   });
   return app;
 }
