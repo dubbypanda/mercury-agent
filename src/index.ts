@@ -5,6 +5,10 @@ import { Command } from 'commander';
 import readline from 'node:readline';
 import chalk from 'chalk';
 
+// Prevent EPIPE errors from crashing the process — these occur when writing
+// to a closed pipe (e.g. terminal exits, daemon stdout closes). Harmless.
+process.on('SIGPIPE', () => {});
+
 import {
   loadConfig,
   saveConfig,
@@ -83,8 +87,8 @@ import { startBackground, stopDaemon, showLogs, getDaemonStatus, restartDaemon, 
 import { installService, uninstallService, showServiceStatus, isServiceInstalled } from './cli/service.js';
 import { runWithWatchdog } from './cli/watchdog.js';
 import { setGitHubToken } from './utils/github.js';
-import { selectWithArrowKeys } from './utils/arrow-select.js';
-import { ProviderModelFetchError, fetchProviderModelCatalog } from './utils/provider-models.js';
+import { selectWithArrowKeys, searchWithArrowKeys } from './utils/arrow-select.js';
+import { ProviderModelFetchError, fetchProviderModelCatalog, fetchFullOpenRouterCatalog } from './utils/provider-models.js';
 import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders } from './web/server.js';
 import { isWebAuthInitialized, setWebPassword } from './web/auth.js';
 
@@ -156,6 +160,7 @@ const PROVIDER_OPTIONS: Array<{ key: ProviderName; label: string }> = [
   { key: 'deepseek', label: 'DeepSeek' },
   { key: 'openai', label: 'OpenAI' },
   { key: 'anthropic', label: 'Anthropic' },
+  { key: 'openrouter', label: 'OpenRouter' },
   { key: 'githubCopilot', label: 'GitHub Copilot' },
   { key: 'grok', label: 'Grok (xAI)' },
   { key: 'ollamaCloud', label: 'Ollama Cloud' },
@@ -176,6 +181,7 @@ function getConfiguredProviderNames(config: MercuryConfig): ProviderName[] {
 
 function getProviderLabel(name: ProviderName): string {
   if (name === 'chatgptWeb') return 'OpenAI (ChatGPT Plus/Pro)';
+  if (name === 'openrouter') return 'OpenRouter';
   return PROVIDER_OPTIONS.find((option) => option.key === name)?.label || name;
 }
 
@@ -318,6 +324,12 @@ function validateApiKey(provider: ProviderName, value: string): string | null {
       : 'MiMo Token Plan keys must start with `tp-`.';
   }
 
+  if (provider === 'openrouter') {
+    return /^sk-or-v[12]-/.test(value)
+      ? null
+      : 'OpenRouter keys must start with `sk-or-v1-` or `sk-or-v2-`.';
+  }
+
   return null;
 }
 
@@ -382,6 +394,194 @@ async function chooseProviderModel(
     }
 
     console.log(chalk.red(`  ${error}`));
+  }
+}
+
+async function chooseOpenRouterModel(
+  recommendedModel: string,
+  models: string[],
+  fullCatalog: string[],
+): Promise<string> {
+  const SEARCH_OPTION = '__search__';
+  const CUSTOM_OPTION = '__custom__';
+  const DEFAULT_OPTION = '__default__';
+
+  const topModels = models.slice(0, 15);
+
+  const selection = await selectWithArrowKeys(
+    'OpenRouter Models',
+    [
+      { value: SEARCH_OPTION, label: '🔍 Search models...' },
+      { value: DEFAULT_OPTION, label: `Use provider default (${recommendedModel})` },
+      ...topModels.map((model) => ({
+        value: model,
+        label: model,
+      })),
+      { value: CUSTOM_OPTION, label: 'Enter a custom model name' },
+    ],
+    { helperText: 'Use arrow keys, then press Enter. Select "Search" to filter 300+ models.' },
+  );
+
+  if (!selection || selection === DEFAULT_OPTION) {
+    return recommendedModel;
+  }
+
+  if (selection === SEARCH_OPTION) {
+    const allOptions: Array<{ value: string; label: string }> = fullCatalog.map((m) => ({
+      value: m,
+      label: m,
+    }));
+
+    const searched = await searchWithArrowKeys(
+      'Search OpenRouter Models',
+      allOptions,
+      { helperText: 'Type to search, arrow keys to navigate, Enter to select, Esc to clear.' },
+    );
+
+    if (!searched) {
+      return chooseOpenRouterModel(recommendedModel, models, fullCatalog);
+    }
+
+    return searched;
+  }
+
+  if (selection !== CUSTOM_OPTION) {
+    return selection;
+  }
+
+  while (true) {
+    const customModel = await ask(chalk.white('  OpenRouter model name [Enter for default]: '));
+    if (!customModel) {
+      return recommendedModel;
+    }
+
+    const error = validateModelName(customModel);
+    if (!error) {
+      if (fullCatalog.length > 0 && !fullCatalog.includes(customModel)) {
+        const suggestion = findClosestModel(customModel, fullCatalog);
+        if (suggestion) {
+          console.log(chalk.red(`  Model "${customModel}" not found in OpenRouter catalog.`));
+          console.log(chalk.dim(`  Did you mean: ${suggestion}?`));
+          const useSuggestion = await ask(chalk.white(`  Use "${suggestion}" instead? [Y/n]: `));
+          if (useSuggestion.toLowerCase() !== 'n') {
+            return suggestion;
+          }
+        } else {
+          console.log(chalk.red(`  Model "${customModel}" not found in OpenRouter catalog.`));
+          console.log(chalk.dim('  Please select from the catalog or use the search option.'));
+        }
+        continue;
+      }
+      return customModel;
+    }
+
+    console.log(chalk.red(`  ${error}`));
+  }
+}
+
+function findClosestModel(input: string, catalog: string[]): string | null {
+  const lower = input.toLowerCase();
+  let bestMatch = '';
+  let bestScore = Infinity;
+
+  for (const model of catalog) {
+    const modelLower = model.toLowerCase();
+    if (modelLower === lower) return model;
+
+    if (modelLower.includes(lower) || lower.includes(modelLower.split('/').pop() ?? '')) {
+      const score = Math.abs(model.length - input.length);
+      if (score < bestScore) {
+        bestScore = score;
+        bestMatch = model;
+      }
+    }
+  }
+
+  if (!bestMatch && catalog.length > 0) {
+    const inputParts = lower.split('/');
+    if (inputParts.length === 2) {
+      const [provider, modelName] = inputParts;
+      for (const model of catalog) {
+        const modelLower = model.toLowerCase();
+        const modelParts = modelLower.split('/');
+        if (modelParts.length === 2 && modelParts[0] === provider) {
+          if (modelParts[1].includes(modelName) || modelName.includes(modelParts[1])) {
+            return model;
+          }
+        }
+      }
+    }
+  }
+
+  return bestMatch || null;
+}
+
+async function promptOpenRouterModelSelection(config: MercuryConfig, isReconfig: boolean): Promise<{ apiKey?: string; model?: string; skipped: boolean }> {
+  const existingConfig = config.providers.openrouter;
+
+  while (true) {
+    const mask = isReconfig && existingConfig.apiKey ? ` [${maskKey(existingConfig.apiKey)}]` : '';
+    const value = await ask(chalk.white(`  OpenRouter API key${mask}${isReconfig ? '' : ' (Enter to skip)'}: `));
+    if (!value) {
+      if (isReconfig && existingConfig.apiKey) {
+        return { apiKey: existingConfig.apiKey, model: existingConfig.model, skipped: true };
+      }
+      return { skipped: true };
+    }
+
+    const formatError = validateApiKey('openrouter', value);
+    if (formatError) {
+      console.log(chalk.red(`  ${formatError}`));
+      continue;
+    }
+
+    console.log(chalk.dim('  Validating OpenRouter and fetching models...'));
+    try {
+      const catalog = await fetchProviderModelCatalog('openrouter', {
+        ...existingConfig,
+        apiKey: value,
+      });
+
+      let fullCatalog: string[] = [];
+      try {
+        fullCatalog = await fetchFullOpenRouterCatalog({
+          ...existingConfig,
+          apiKey: value,
+        });
+      } catch {
+        fullCatalog = catalog.models;
+      }
+
+      const model = await chooseOpenRouterModel(
+        catalog.recommendedModel,
+        catalog.models,
+        fullCatalog,
+      );
+      return { apiKey: value, model, skipped: false };
+    } catch (error) {
+      const message = error instanceof ProviderModelFetchError
+        ? error.message
+        : 'Mercury could not fetch models for OpenRouter.';
+      console.log(chalk.yellow(`  ${message}`));
+      console.log(chalk.dim('  The API key looks valid but Mercury could not reach OpenRouter.'));
+      console.log(chalk.dim('  You can enter a model name manually, or skip OpenRouter for now.'));
+
+      const manualModel = await ask(chalk.white('  OpenRouter model name (Enter to skip OpenRouter for now): '));
+      if (!manualModel) {
+        if (isReconfig && existingConfig.apiKey) {
+          return { apiKey: existingConfig.apiKey, model: existingConfig.model, skipped: true };
+        }
+        return { skipped: true };
+      }
+
+      const modelError = validateModelName(manualModel);
+      if (modelError) {
+        console.log(chalk.red(`  ${modelError}`));
+        continue;
+      }
+
+      return { apiKey: value, model: manualModel, skipped: false };
+    }
   }
 }
 
@@ -1686,6 +1886,16 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
           config.providers.mimoTokenPlan.apiKey = result.apiKey;
           config.providers.mimoTokenPlan.model = result.model;
           config.providers.mimoTokenPlan.enabled = true;
+        }
+        continue;
+      }
+
+      if (provider === 'openrouter') {
+        const result = await promptOpenRouterModelSelection(config, isReconfig);
+        if (!result.skipped && result.apiKey && result.model) {
+          config.providers.openrouter.apiKey = result.apiKey;
+          config.providers.openrouter.model = result.model;
+          config.providers.openrouter.enabled = true;
         }
         continue;
       }

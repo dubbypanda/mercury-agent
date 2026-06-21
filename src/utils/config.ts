@@ -65,7 +65,8 @@ export type ProviderName =
   | 'mimo'
   | 'mimoTokenPlan'
   | 'chatgptWeb'
-  | 'githubCopilot';
+  | 'githubCopilot'
+  | 'openrouter';
 
 export interface MercuryConfig {
   identity: {
@@ -86,6 +87,7 @@ export interface MercuryConfig {
     mimoTokenPlan: ProviderConfig;
     chatgptWeb: ProviderConfig;
     githubCopilot: ProviderConfig;
+    openrouter: ProviderConfig;
   };
   channels: {
     telegram: {
@@ -309,6 +311,13 @@ export function getDefaultConfig(): MercuryConfig {
         model: getEnv('GITHUB_COPILOT_MODEL', 'gpt-4o'),
         enabled: getEnvBool('GITHUB_COPILOT_ENABLED', false),
       },
+      openrouter: {
+        name: 'openrouter',
+        apiKey: getEnv('OPENROUTER_API_KEY', ''),
+        baseUrl: getEnv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1'),
+        model: getEnv('OPENROUTER_MODEL', 'anthropic/claude-sonnet-4'),
+        enabled: getEnvBool('OPENROUTER_ENABLED', true),
+      },
     },
     channels: {
       telegram: {
@@ -520,6 +529,9 @@ export function isProviderConfigured(provider: ProviderConfig): boolean {
     // GitHub Copilot uses GitHub OAuth, not API keys.
     // Considered "configured" if enabled with a model selected.
     return provider.model.length > 0;
+  }
+  if (provider.name === 'openrouter') {
+    return provider.apiKey.length > 0;
   }
   return provider.apiKey.length > 0;
 }
