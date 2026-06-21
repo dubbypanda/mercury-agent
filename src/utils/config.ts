@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { config as loadDotenv } from 'dotenv';
-import type { SignalAccessUser, SignalPendingRequest, DiscordAccessUser, DiscordPendingRequest, SlackAccessUser, SlackPendingRequest, WhatsAppAdmin } from '../types/channel.js';
+import type { SignalAccessUser, SignalPendingRequest, DiscordAccessUser, DiscordPendingRequest, SlackAccessUser, SlackPendingRequest, WhatsAppAdmin, IMessagesAccessUser } from '../types/channel.js';
 
 const MERCURY_HOME = join(homedir(), '.mercury');
 
@@ -143,6 +143,16 @@ export interface MercuryConfig {
       mode: string;
       groupId?: string;
       groupName?: string;
+    };
+    imessages: {
+      enabled: boolean;
+      projectId: string;
+      projectSecret: string;
+      allowedUsers: string[];
+      allowAllUsers: boolean;
+      markdown: boolean;
+      reactions: boolean;
+      maxInlineAttachmentBytes: number;
     };
   };
   github: {
@@ -356,6 +366,18 @@ export function getDefaultConfig(): MercuryConfig {
         mode: getEnv('WHATSAPP_MODE', 'group'),
         groupId: getEnv('WHATSAPP_GROUP_ID', ''),
         groupName: getEnv('WHATSAPP_GROUP_NAME', 'Mercury'),
+      },
+      imessages: {
+        enabled: getEnvBool('IMESSAGES_ENABLED', false),
+        projectId: getEnv('IMESSAGES_PROJECT_ID', ''),
+        projectSecret: getEnv('IMESSAGES_PROJECT_SECRET', ''),
+        allowedUsers: getEnv('IMESSAGES_ALLOWED_USERS', '')
+          .split(',')
+          .filter(Boolean),
+        allowAllUsers: getEnvBool('IMESSAGES_ALLOW_ALL_USERS', false),
+        markdown: getEnvBool('IMESSAGES_MARKDOWN', true),
+        reactions: getEnvBool('IMESSAGES_REACTIONS', false),
+        maxInlineAttachmentBytes: getEnvNum('IMESSAGES_MAX_INLINE_ATTACHMENT_BYTES', 20 * 1024 * 1024),
       },
     },
     github: {
@@ -1225,4 +1247,17 @@ export function migrateLegacyWhatsAppAccess(config: MercuryConfig): MercuryConfi
   delete wa.members;
   delete wa.pending;
   return config;
+}
+
+// ── iMessage access helpers ──────────────────────────────────────
+
+export function isIMessagesAllowed(config: MercuryConfig, address: string): boolean {
+  if (config.channels.imessages.allowAllUsers) return true;
+  return config.channels.imessages.allowedUsers.includes(address);
+}
+
+export function getIMessagesAccessSummary(config: MercuryConfig): string {
+  const { allowedUsers, allowAllUsers } = config.channels.imessages;
+  if (allowAllUsers) return 'open access (all users)';
+  return `${allowedUsers.length} allowed user${allowedUsers.length === 1 ? '' : 's'}`;
 }

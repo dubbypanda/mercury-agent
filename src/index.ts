@@ -49,6 +49,8 @@ import {
   setWhatsAppAdmin,
   clearWhatsAppAccess,
   isWhatsAppPaired,
+  isIMessagesAllowed,
+  getIMessagesAccessSummary,
 } from './utils/config.js';
 import type { MercuryConfig } from './utils/config.js';
 import type { ProviderName } from './utils/config.js';
@@ -2157,6 +2159,108 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
     }
   }
 
+  // ── iMessages ──────────────────────────────────────────────────────
+  hr();
+  console.log('');
+  console.log(chalk.bold.white('  iMessages (optional)'));
+  console.log(chalk.dim('  Chat with Mercury through iMessage via Photon Spectrum (cloud mode).'));
+  console.log(chalk.dim('  Works on any OS — no Mac required. Auto-discovers the bot number.'));
+  console.log(chalk.dim('  You can add it later with mercury doctor.'));
+  console.log('');
+
+  const im = config.channels.imessages;
+  const imConfigured = im.enabled && !!im.projectId && !!im.projectSecret;
+
+  if (isReconfig && imConfigured) {
+    const summary = getIMessagesAccessSummary(config);
+    console.log(chalk.green(`  ✓ iMessages configured — ${summary}`));
+    const reconfig = await ask(chalk.white('  Reconfigure? (y/N): '));
+    if (reconfig.trim().toLowerCase() === 'y' || reconfig.trim().toLowerCase() === 'yes') {
+      console.log(chalk.dim('  Enter "none" to disable iMessages.'));
+      console.log('');
+      const imProjectId = await ask(chalk.white(`  Photon Project ID [${maskKey(im.projectId)}]: `));
+      if (imProjectId.toLowerCase() === 'none') {
+        config.channels.imessages.enabled = false;
+        config.channels.imessages.projectId = '';
+        config.channels.imessages.projectSecret = '';
+        config.channels.imessages.allowedUsers = [];
+        config.channels.imessages.allowAllUsers = false;
+        saveConfig(config);
+      } else if (imProjectId) {
+        config.channels.imessages.projectId = imProjectId;
+        const imProjectSecret = await ask(chalk.white(`  Photon Project Secret [${maskKey(im.projectSecret)}]: `));
+        if (imProjectSecret) {
+          appendToEnv('IMESSAGES_PROJECT_SECRET', imProjectSecret);
+          config.channels.imessages.projectSecret = imProjectSecret;
+        }
+        const imUsers = await ask(chalk.white(`  Allowed addresses (comma-separated phone/email) [${im.allowedUsers.join(', ')}]: `));
+        if (imUsers) {
+          config.channels.imessages.allowedUsers = imUsers.split(',').map((u: string) => u.trim()).filter(Boolean);
+        }
+        const imAllowAll = await ask(chalk.white(`  Allow all users? (y/N) [${im.allowAllUsers ? 'Y' : 'N'}]: `));
+        config.channels.imessages.allowAllUsers = imAllowAll.toLowerCase() === 'y' || imAllowAll.toLowerCase() === 'yes';
+        config.channels.imessages.enabled = true;
+        saveConfig(config);
+      }
+    }
+  } else {
+    const imSetup = await ask(chalk.white('  Configure iMessages? (y/N): '));
+    if (imSetup.toLowerCase() === 'y' || imSetup.toLowerCase() === 'yes') {
+      console.log('');
+      console.log(chalk.dim('  ── How to get your Photon credentials ──'));
+      console.log('');
+      console.log(chalk.dim('  1. Sign up at https://app.photon.codes'));
+      console.log(chalk.dim('     (free tier: unlimited messages, up to 10 users)'));
+      console.log('');
+      console.log(chalk.dim('  2. Create a new project in the dashboard'));
+      console.log('');
+      console.log(chalk.dim('  3. In the project, add the iMessage provider:'));
+      console.log(chalk.dim('     click "Add Platform" → select "iMessage" → enable "Cloud Mode"'));
+      console.log(chalk.dim('     (Cloud Mode gives you a managed iMessage line — no Mac needed)'));
+      console.log('');
+      console.log(chalk.dim('  4. Copy the Project ID and Project Secret from'));
+      console.log(chalk.dim('     Settings → API Credentials'));
+      console.log('');
+      console.log(chalk.dim('  Docs: https://docs.photon.codes/spectrum-ts/providers/imessage'));
+      console.log('');
+      const imProjectId = await ask(chalk.white('  Photon Project ID: '));
+      if (imProjectId) {
+        const imProjectSecret = await ask(chalk.white('  Photon Project Secret: '));
+        if (imProjectSecret) {
+          appendToEnv('IMESSAGES_PROJECT_SECRET', imProjectSecret);
+        }
+        console.log('');
+        console.log(chalk.dim('  Enter addresses of users who can message Mercury.'));
+        console.log(chalk.dim('  Phone numbers with country code (e.g., +1234567890) or Apple ID emails.'));
+        console.log(chalk.dim('  Enter "all" to allow anyone, or press Enter to set up the allow list later.'));
+        const imUsers = await ask(chalk.white('  Allowed addresses (comma-separated, or "all"): '));
+        if (imUsers.toLowerCase() === 'all') {
+          config.channels.imessages.allowAllUsers = true;
+          config.channels.imessages.allowedUsers = [];
+        } else if (imUsers) {
+          config.channels.imessages.allowedUsers = imUsers.split(',').map((u: string) => u.trim()).filter(Boolean);
+          config.channels.imessages.allowAllUsers = false;
+        }
+        config.channels.imessages.projectId = imProjectId;
+        config.channels.imessages.projectSecret = imProjectSecret || '';
+        config.channels.imessages.enabled = true;
+        saveConfig(config);
+        console.log('');
+        console.log(chalk.green('  ✓ iMessages configured!'));
+        console.log(chalk.dim('  Mercury will connect to iMessage via Photon Spectrum when started.'));
+        console.log(chalk.dim('  The bot phone number will be auto-detected from the first message.'));
+        console.log(chalk.dim('  Text your Photon iMessage line to verify the connection.'));
+        console.log('');
+      } else {
+        config.channels.imessages.enabled = false;
+        saveConfig(config);
+      }
+    } else {
+      config.channels.imessages.enabled = false;
+      saveConfig(config);
+    }
+  }
+
   hr();
   console.log('');
   console.log(chalk.bold.white('  GitHub Integration (optional)'));
@@ -2544,8 +2648,13 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     const telegram = channels.get('telegram');
     const signal = channels.get('signal');
     const whatsapp = channels.get('whatsapp');
+    const imessages = channels.get('imessages');
 
     // Explicit channel override from the user
+    if (channel === 'imessages' && imessages) {
+      await imessages.sendFile(filePath, channelType === 'imessages' ? channelId : undefined);
+      return;
+    }
     if (channel === 'signal' && signal) {
       await signal.sendFile(filePath, channelType === 'signal' ? channelId : undefined);
       return;
@@ -2556,6 +2665,11 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     }
     if (channel === 'whatsapp' && whatsapp) {
       await whatsapp.sendFile(filePath, channelType === 'whatsapp' ? channelId : undefined);
+      return;
+    }
+
+    if (channelType === 'imessages' && imessages) {
+      await imessages.sendFile(filePath, channelId);
       return;
     }
 
@@ -2571,6 +2685,11 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
 
     if (channelType === 'whatsapp' && whatsapp) {
       await whatsapp.sendFile(filePath, channelId);
+      return;
+    }
+
+    if (config.channels.imessages.enabled && imessages && (config.channels.imessages.allowAllUsers || config.channels.imessages.allowedUsers.length > 0)) {
+      await imessages.sendFile(filePath);
       return;
     }
 

@@ -84,6 +84,7 @@
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "react": "^18.3.1",
+    "spectrum-ts": "5.1.0",
     "sql.js": "^1.14.1",
     "yaml": "^2.7.0",
     "zod": "^3.25.76"
